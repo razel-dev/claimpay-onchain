@@ -252,6 +252,20 @@ contract ClaimPay is AccessControl {
         emit MilestoneStarted(id, index);
     }
 
+    /// @notice Le provider soumet le livrable (empreinte 32 octets). IN_PROGRESS -> SUBMITTED.
+    /// @dev Réutilisable après une révision : écrase deliverableHash et submittedAt.
+    function submitMilestone(uint256 id, uint256 index, bytes32 deliverableHash) external {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.provider) revert NotProvider();
+        Milestone storage m = a.milestones[index];
+        if (m.state != MilestoneState.IN_PROGRESS) revert InvalidMilestoneState();
+
+        m.deliverableHash = deliverableHash;
+        m.submittedAt = uint64(block.timestamp);
+        m.state = MilestoneState.SUBMITTED;
+        emit MilestoneSubmitted(id, index, deliverableHash);
+    }
+
     // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
