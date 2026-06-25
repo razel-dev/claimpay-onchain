@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 /// @title ClaimPay — protocole de paiement conditionnel non-custodial
 /// @notice Le contrat ne stocke que des engagements (montants, hashes, statuts),
@@ -223,6 +224,32 @@ contract ClaimPay is AccessControl {
         if (block.timestamp > uint256(a.createdAt) + uint256(a.responseDeadline)) revert DeadlinePassed();
         a.state = AgreementState.ACTIVE;
         emit AgreementSigned(id, msg.sender);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                          Cycle de vie du palier                       //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Le client démarre le palier courant : vérification de solvabilité
+    ///         front-loadée, SANS custody. PENDING -> IN_PROGRESS.
+    /// @dev C'est le CLIENT qui démarre : il engage sa volonté de payer, et la
+    ///      vérification porte sur SON allowance/balance. Le provider doit ensuite
+    ///      soumettre ; à défaut, US-13 (provider fantôme, Sprint 10).
+    function startMilestone(uint256 id, uint256 index) external {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.client) revert NotClient();
+        if (a.state != AgreementState.ACTIVE) revert InvalidAgreementState();
+        if (index != a.cursor) revert NotCurrentMilestone();
+        Milestone storage m = a.milestones[index];
+        if (m.state != MilestoneState.PENDING) revert InvalidMilestoneState();
+
+        IERC20 t = IERC20(a.token);
+        if (t.allowance(a.client, address(this)) < m.amount) revert InsufficientAllowance();
+        if (t.balanceOf(a.client) < m.amount) revert InsufficientBalance();
+
+        m.startedAt = uint64(block.timestamp);
+        m.state = MilestoneState.IN_PROGRESS;
+        emit MilestoneStarted(id, index);
     }
 
     // --------------------------------------------------------------------- //
