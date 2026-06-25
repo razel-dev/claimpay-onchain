@@ -293,6 +293,21 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
         emit MilestonePaid(id, index, a.client, a.provider, amount);
     }
 
+    /// @notice Le client demande une révision : aller-retour collaboratif, sans
+    ///         conséquence sur les fonds. SUBMITTED -> IN_PROGRESS. Appelable en boucle.
+    /// @dev Distinct du litige : aucun mouvement de fonds, cursor inchangé. Le
+    ///      compteur de révisions et tout seuil/nudge vivent côté app.
+    ///      submittedAt est conservé : il marque qu'on est en boucle de révision.
+    function requestRevision(uint256 id, uint256 index) external {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.client) revert NotClient();
+        Milestone storage m = a.milestones[index];
+        if (m.state != MilestoneState.SUBMITTED) revert InvalidMilestoneState();
+
+        m.state = MilestoneState.IN_PROGRESS;
+        emit RevisionRequested(id, index);
+    }
+
     // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
