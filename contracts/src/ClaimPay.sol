@@ -417,6 +417,57 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
     }
 
     // --------------------------------------------------------------------- //
+    //                                 Views                                 //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Lecture des champs scalaires d'un accord (le front et les tests
+    ///         en ont besoin ; les paliers se lisent via getMilestone/milestonesOf).
+    function getAgreement(uint256 id)
+        external
+        view
+        returns (
+            address client,
+            address provider,
+            address token,
+            address arbiter,
+            uint256 totalAmount,
+            AgreementState state,
+            uint256 cursor,
+            bytes32 termsHash,
+            uint64 createdAt,
+            uint64 responseDeadline,
+            uint256 milestoneCount
+        )
+    {
+        Agreement storage a = _get(id);
+        return (
+            a.client,
+            a.provider,
+            a.token,
+            a.arbiter,
+            a.totalAmount,
+            a.state,
+            a.cursor,
+            a.termsHash,
+            a.createdAt,
+            a.responseDeadline,
+            a.milestones.length
+        );
+    }
+
+    /// @notice Lecture d'un palier précis.
+    function getMilestone(uint256 id, uint256 index) external view returns (Milestone memory) {
+        Agreement storage a = _get(id);
+        return a.milestones[index];
+    }
+
+    /// @notice Lecture de tous les paliers d'un accord.
+    function milestonesOf(uint256 id) external view returns (Milestone[] memory) {
+        Agreement storage a = _get(id);
+        return a.milestones;
+    }
+
+    // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
 
@@ -425,3 +476,4 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
         a = _agreements[id];
     }
 }
+
