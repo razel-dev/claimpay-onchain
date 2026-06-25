@@ -390,6 +390,30 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
         emit DisputeResolved(id, index, a.client, a.provider, amountToProvider);
     }
 
+    /// @notice Annulation par le client en cas d'expiration (jamais signé / jamais démarré).
+    /// @dev Aucun fonds en jeu (non-custodial), donc rien à restituer.
+    ///      Impossible avant l'échéance, et impossible dès qu'un palier a progressé.
+    function cancelAgreement(uint256 id) external {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.client) revert NotClient();
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp <= uint256(a.createdAt) + uint256(a.responseDeadline)) {
+            revert DeadlineNotReached();
+        }
+
+        // Cas 1 (US-12) — jamais signé : le provider n'a pas signé à temps.
+        // (SIGNED n'est jamais persisté, donc seul DRAFT est observable ici.)
+        bool neverSigned = a.state == AgreementState.DRAFT || a.state == AgreementState.SIGNED;
+        // Cas 2 (US-12) — actif mais aucun palier démarré.
+        bool activeUntouched = a.state == AgreementState.ACTIVE && a.cursor == 0
+            && a.milestones[0].state == MilestoneState.PENDING;
+
+        if (!neverSigned && !activeUntouched) revert CannotCancel();
+
+        a.state = AgreementState.CANCELLED;
+        emit AgreementCancelled(id, msg.sender);
+    }
+
     // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
