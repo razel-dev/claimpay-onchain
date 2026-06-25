@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
+import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 
 /// @title ClaimPay — protocole de paiement conditionnel non-custodial
 /// @notice Le contrat ne stocke que des engagements (montants, hashes, statuts),
@@ -15,7 +16,7 @@ pragma solidity ^0.8.24;
 ///                                           ↘ DISPUTED -> RESOLVED -> (PAID | VOID)
 ///         (SIGNED, APPROVED, RESOLVED sont transitoires : l'écriture finale
 ///          stockée est respectivement ACTIVE, PAID, et PAID|VOID.)
-contract ClaimPay {
+contract ClaimPay is AccessControl {
     // --------------------------------------------------------------------- //
     //                                 Types                                  //
     // --------------------------------------------------------------------- //
@@ -126,4 +127,27 @@ contract ClaimPay {
     error InsufficientBalance();
     error AmountExceedsMilestone();
     error CannotCancel();
+
+    // --------------------------------------------------------------------- //
+    //                              Constructor                              //
+    // --------------------------------------------------------------------- //
+
+    /// @param admin détenteur de DEFAULT_ADMIN_ROLE (gère la whitelist de tokens).
+    constructor(address admin) {
+        _grantRole(DEFAULT_ADMIN_ROLE, admin == address(0) ? msg.sender : admin);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                         Admin : token whitelist                       //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Autorise ou retire un token comme moyen de paiement.
+    /// @dev Réservé à DEFAULT_ADMIN_ROLE. La whitelist n'est consultée qu'à la
+    ///      création d'un accord : un accord déjà créé reste valide même si le
+    ///      token est retiré ensuite (immutabilité du token de l'accord).
+    function setTokenWhitelisted(address token, bool allowed) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (token == address(0)) revert ZeroAddress();
+        isTokenWhitelisted[token] = allowed;
+        emit TokenWhitelisted(token, allowed);
+    }
 }
