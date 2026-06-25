@@ -2,6 +2,8 @@
 pragma solidity ^0.8.24;
 import {AccessControl} from "@openzeppelin/contracts/access/AccessControl.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title ClaimPay — protocole de paiement conditionnel non-custodial
 /// @notice Le contrat ne stocke que des engagements (montants, hashes, statuts),
@@ -17,7 +19,8 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 ///                                           ↘ DISPUTED -> RESOLVED -> (PAID | VOID)
 ///         (SIGNED, APPROVED, RESOLVED sont transitoires : l'écriture finale
 ///          stockée est respectivement ACTIVE, PAID, et PAID|VOID.)
-contract ClaimPay is AccessControl {
+contract ClaimPay is AccessControl, ReentrancyGuard {
+    using SafeERC20 for IERC20;
     // --------------------------------------------------------------------- //
     //                                 Types                                  //
     // --------------------------------------------------------------------- //
@@ -264,6 +267,30 @@ contract ClaimPay is AccessControl {
         m.submittedAt = uint64(block.timestamp);
         m.state = MilestoneState.SUBMITTED;
         emit MilestoneSubmitted(id, index, deliverableHash);
+    }
+
+    /// @notice L'approbation EST le paiement, atomique. SUBMITTED -> PAID.
+    /// @dev Pattern Checks-Effects-Interactions + nonReentrant. Si l'allowance ou le
+    ///      solde du client est insuffisant au moment du transfert, toute la
+    ///      transaction revert (rollback global) : aucun état n'est avancé.
+    function approveMilestone(uint256 id, uint256 index) external nonReentrant {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.client) revert NotClient();
+        if (index != a.cursor) revert NotCurrentMilestone();
+        Milestone storage m = a.milestones[index];
+        if (m.state != MilestoneState.SUBMITTED) revert InvalidMilestoneState();
+
+        uint256 amount = m.amount;
+
+        // ---- Effects ----
+        m.state = MilestoneState.PAID;
+        a.cursor = index + 1;
+        if (a.cursor == a.milestones.length) a.state = AgreementState.COMPLETED;
+
+        // ---- Interaction ----
+        IERC20(a.token).safeTransferFrom(a.client, a.provider, amount);
+
+        emit MilestonePaid(id, index, a.client, a.provider, amount);
     }
 
     // --------------------------------------------------------------------- //
