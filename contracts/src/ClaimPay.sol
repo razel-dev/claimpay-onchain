@@ -364,6 +364,32 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
         emit DisputeOpened(id, index, msg.sender);
     }
 
+    /// @notice L'arbitre tranche : l'issue déplace (ou non) les fonds. -> PAID | VOID.
+    /// @param amountToProvider montant accordé au provider (≤ amount du palier).
+    ///        Le reliquat (amount - amountToProvider) n'est jamais transféré : il
+    ///        reste simplement chez le client (rien n'était séquestré).
+    /// @dev CEI + nonReentrant. amountToProvider == 0 => VOID (aucun transfert).
+    function resolveDispute(uint256 id, uint256 index, uint256 amountToProvider) external nonReentrant {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.arbiter) revert NotArbiter();
+        if (index != a.cursor) revert NotCurrentMilestone();
+        Milestone storage m = a.milestones[index];
+        if (m.state != MilestoneState.DISPUTED) revert InvalidMilestoneState();
+        if (amountToProvider > m.amount) revert AmountExceedsMilestone();
+
+        // ---- Effects ----
+        m.state = amountToProvider > 0 ? MilestoneState.PAID : MilestoneState.VOID;
+        a.cursor = index + 1;
+        if (a.cursor == a.milestones.length) a.state = AgreementState.COMPLETED;
+
+        // ---- Interaction ----
+        if (amountToProvider > 0) {
+            IERC20(a.token).safeTransferFrom(a.client, a.provider, amountToProvider);
+        }
+
+        emit DisputeResolved(id, index, a.client, a.provider, amountToProvider);
+    }
+
     // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
