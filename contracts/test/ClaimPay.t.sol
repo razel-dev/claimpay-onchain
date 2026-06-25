@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import {Test} from "forge-std/Test.sol";
+import {ClaimPay} from "../src/ClaimPay.sol";
+import {MockUSDC} from "./mocks/MockUSDC.sol";
+
+contract ClaimPayTest is Test {
+    ClaimPay internal claimpay;
+    MockUSDC internal usdc;
+
+    address internal admin = makeAddr("admin");
+    address internal client = makeAddr("client");
+    address internal provider = makeAddr("provider");
+    address internal arbiter = makeAddr("arbiter");
+
+    uint64 internal constant DEADLINE = 3 days;
+
+    event AgreementCreated(
+        uint256 indexed id,
+        address indexed client,
+        address indexed provider,
+        address token,
+        address arbiter,
+        uint256 totalAmount,
+        uint256 milestoneCount
+    );
+    event AgreementSigned(uint256 indexed id, address indexed provider);
+
+    function setUp() public {
+        vm.prank(admin);
+        claimpay = new ClaimPay(admin);
+
+        usdc = new MockUSDC();
+
+        vm.prank(admin);
+        claimpay.setTokenWhitelisted(address(usdc), true);
+    }
+
+    function _amounts() internal pure returns (uint256[] memory a) {
+        a = new uint256[](2);
+        a[0] = 1_000e6;
+        a[1] = 500e6;
+    }
+
+    function _create() internal returns (uint256 id) {
+        vm.prank(client);
+        id = claimpay.createAgreement(provider, address(usdc), _amounts(), bytes32("terms"), arbiter, DEADLINE);
+    }
+
+    function test_createAgreement_nominal() public {
+        vm.expectEmit(true, true, true, true);
+        emit AgreementCreated(0, client, provider, address(usdc), arbiter, 1_500e6, 2);
+
+        uint256 id = _create();
+
+        assertEq(id, 0);
+        assertEq(claimpay.agreementCount(), 1);
+
+        (
+            address c,
+            address p,
+            address t,
+            address arb,
+            uint256 total,
+            ClaimPay.AgreementState state,
+            uint256 cursor,
+            ,
+            ,
+            ,
+            uint256 mcount
+        ) = claimpay.getAgreement(id);
+
+        assertEq(c, client);
+        assertEq(p, provider);
+        assertEq(t, address(usdc));
+        assertEq(arb, arbiter);
+        assertEq(total, 1_500e6);
+        assertEq(uint256(state), uint256(ClaimPay.AgreementState.DRAFT));
+        assertEq(cursor, 0);
+        assertEq(mcount, 2);
+    }
+
+    function test_createAgreement_revert_tokenNotWhitelisted() public {
+        MockUSDC other = new MockUSDC();
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.TokenNotWhitelisted.selector);
+        claimpay.createAgreement(provider, address(other), _amounts(), bytes32(0), arbiter, DEADLINE);
+    }
+
+    function test_createAgreement_revert_providerIsClient() public {
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.ProviderIsClient.selector);
+        claimpay.createAgreement(client, address(usdc), _amounts(), bytes32(0), arbiter, DEADLINE);
+    }
+
+    function test_createAgreement_revert_arbiterNotNeutral() public {
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.ArbiterNotNeutral.selector);
+        claimpay.createAgreement(provider, address(usdc), _amounts(), bytes32(0), provider, DEADLINE);
+    }
+
+    function test_createAgreement_revert_emptyMilestones() public {
+        uint256[] memory empty = new uint256[](0);
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.EmptyMilestones.selector);
+        claimpay.createAgreement(provider, address(usdc), empty, bytes32(0), arbiter, DEADLINE);
+    }
+
+    function test_createAgreement_revert_zeroMilestoneAmount() public {
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = 1_000e6;
+        amts[1] = 0;
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.ZeroMilestoneAmount.selector);
+        claimpay.createAgreement(provider, address(usdc), amts, bytes32(0), arbiter, DEADLINE);
+    }
+
+    function test_createAgreement_revert_zeroDeadline() public {
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.ZeroDeadline.selector);
+        claimpay.createAgreement(provider, address(usdc), _amounts(), bytes32(0), arbiter, 0);
+    }
+
+    function test_signAgreement_nominal() public {
+        uint256 id = _create();
+
+        vm.expectEmit(true, true, false, false);
+        emit AgreementSigned(id, provider);
+
+        vm.prank(provider);
+        claimpay.signAgreement(id);
+
+        (,,,,, ClaimPay.AgreementState state,,,,,) = claimpay.getAgreement(id);
+        assertEq(uint256(state), uint256(ClaimPay.AgreementState.ACTIVE));
+    }
+
+    function test_signAgreement_revert_notProvider() public {
+        uint256 id = _create();
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.NotProvider.selector);
+        claimpay.signAgreement(id);
+    }
+
+    function test_signAgreement_revert_doubleSign() public {
+        uint256 id = _create();
+        vm.prank(provider);
+        claimpay.signAgreement(id);
+
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.InvalidAgreementState.selector);
+        claimpay.signAgreement(id);
+    }
+
+    function test_signAgreement_revert_expired() public {
+        uint256 id = _create();
+        vm.warp(block.timestamp + DEADLINE + 1);
+
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.DeadlinePassed.selector);
+        claimpay.signAgreement(id);
+    }
+}
