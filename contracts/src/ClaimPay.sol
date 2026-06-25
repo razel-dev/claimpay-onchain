@@ -210,4 +210,27 @@ contract ClaimPay is AccessControl {
 
         emit AgreementCreated(id, msg.sender, provider, token, arbiter, total, n);
     }
+
+    /// @notice Le provider accepte l'accord : DRAFT -> SIGNED -> ACTIVE.
+    /// @dev Signature impossible après expiration (createdAt + responseDeadline) : US-12.
+    function signAgreement(uint256 id) external {
+        Agreement storage a = _get(id);
+        if (msg.sender != a.provider) revert NotProvider();
+        if (a.state != AgreementState.DRAFT) revert InvalidAgreementState();
+        // Deadline « grosses mailles » (heures/jours) : la marge de manipulation
+        // de block.timestamp par un validateur (~secondes) est négligeable ici.
+        // forge-lint: disable-next-line(block-timestamp)
+        if (block.timestamp > uint256(a.createdAt) + uint256(a.responseDeadline)) revert DeadlinePassed();
+        a.state = AgreementState.ACTIVE;
+        emit AgreementSigned(id, msg.sender);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                                Internal                               //
+    // --------------------------------------------------------------------- //
+
+    function _get(uint256 id) private view returns (Agreement storage a) {
+        if (id >= agreementCount) revert AgreementDoesNotExist();
+        a = _agreements[id];
+    }
 }
