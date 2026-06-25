@@ -260,6 +260,7 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
     function submitMilestone(uint256 id, uint256 index, bytes32 deliverableHash) external {
         Agreement storage a = _get(id);
         if (msg.sender != a.provider) revert NotProvider();
+        if (index != a.cursor) revert NotCurrentMilestone();
         Milestone storage m = a.milestones[index];
         if (m.state != MilestoneState.IN_PROGRESS) revert InvalidMilestoneState();
 
@@ -301,6 +302,7 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
     function requestRevision(uint256 id, uint256 index) external {
         Agreement storage a = _get(id);
         if (msg.sender != a.client) revert NotClient();
+        if (index != a.cursor) revert NotCurrentMilestone();
         Milestone storage m = a.milestones[index];
         if (m.state != MilestoneState.SUBMITTED) revert InvalidMilestoneState();
 
