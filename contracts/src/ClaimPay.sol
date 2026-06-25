@@ -150,4 +150,64 @@ contract ClaimPay is AccessControl {
         isTokenWhitelisted[token] = allowed;
         emit TokenWhitelisted(token, allowed);
     }
+
+    // --------------------------------------------------------------------- //
+    //                         Cycle de vie de l'accord                      //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Crée un accord et ses paliers. Aucun fonds n'est déplacé ni bloqué.
+    /// @param provider          prestataire (≠ client).
+    /// @param token             moyen de paiement (doit être whitelisté).
+    /// @param amounts           montants des paliers (chacun > 0, au moins un).
+    /// @param termsHash         empreinte des CGU/contrat off-chain (au plus une).
+    /// @param arbiter           tiers neutre (≠ client, ≠ provider).
+    /// @param responseDeadline  durée de réponse en secondes (> 0).
+    /// @return id identifiant de l'accord.
+    function createAgreement(
+        address provider,
+        address token,
+        uint256[] calldata amounts,
+        bytes32 termsHash,
+        address arbiter,
+        uint64 responseDeadline
+    ) external returns (uint256 id) {
+        if (!isTokenWhitelisted[token]) revert TokenNotWhitelisted();
+        if (provider == address(0) || arbiter == address(0)) revert ZeroAddress();
+        if (provider == msg.sender) revert ProviderIsClient();
+        if (arbiter == msg.sender || arbiter == provider) revert ArbiterNotNeutral();
+        uint256 n = amounts.length;
+        if (n == 0) revert EmptyMilestones();
+        if (responseDeadline == 0) revert ZeroDeadline();
+
+        id = agreementCount++;
+        Agreement storage a = _agreements[id];
+        a.client = msg.sender;
+        a.provider = provider;
+        a.token = token;
+        a.arbiter = arbiter;
+        a.termsHash = termsHash;
+        a.state = AgreementState.DRAFT;
+        a.createdAt = uint64(block.timestamp);
+        a.responseDeadline = responseDeadline;
+
+        uint256 total;
+        for (uint256 i; i < n; ++i) {
+            uint256 amt = amounts[i];
+            if (amt == 0) revert ZeroMilestoneAmount();
+            total += amt;
+            a.milestones
+                .push(
+                    Milestone({
+                        amount: amt,
+                        state: MilestoneState.PENDING,
+                        startedAt: 0,
+                        submittedAt: 0,
+                        deliverableHash: bytes32(0)
+                    })
+                );
+        }
+        a.totalAmount = total; // invariant: somme(amounts) == totalAmount, par construction
+
+        emit AgreementCreated(id, msg.sender, provider, token, arbiter, total, n);
+    }
 }
