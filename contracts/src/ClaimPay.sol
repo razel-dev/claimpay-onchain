@@ -309,6 +309,62 @@ contract ClaimPay is AccessControl, ReentrancyGuard {
     }
 
     // --------------------------------------------------------------------- //
+    //                                Litiges                                //
+    // --------------------------------------------------------------------- //
+
+    /// @notice Ouvre un litige sur le palier courant. -> DISPUTED.
+    /// @dev Réutilise createdAt/startedAt/submittedAt — aucun nouveau champ.
+    ///      Quatre voies (toutes pinées sur cursor par le garde d'état) :
+    ///       (A) SUBMITTED + client          : rejet du livrable, à tout moment.
+    ///       (US-14) SUBMITTED + provider     : client fantôme, après submittedAt + délai.
+    ///       (US-13) IN_PROGRESS + client     : provider fantôme (submittedAt == 0),
+    ///                                          après startedAt + délai.
+    ///       (boucle) IN_PROGRESS + provider  : sortie de boucle de révision
+    ///                                          (submittedAt != 0), après submittedAt + délai.
+    ///      Avant l'échéance, les voies à timeout revert (DeadlineNotReached).
+    function openDispute(uint256 id, uint256 index) external {
+        Agreement storage a = _get(id);
+        if (a.state != AgreementState.ACTIVE) revert InvalidAgreementState();
+        if (index != a.cursor) revert NotCurrentMilestone();
+        Milestone storage m = a.milestones[index];
+
+        if (m.state == MilestoneState.SUBMITTED) {
+            if (msg.sender == a.client) {
+                // (A) rejet du livrable — à tout moment.
+            } else if (msg.sender == a.provider) {
+                // (US-14) client fantôme — fenêtre depuis la soumission.
+                // forge-lint: disable-next-line(block-timestamp)
+                if (block.timestamp <= uint256(m.submittedAt) + uint256(a.responseDeadline)) {
+                    revert DeadlineNotReached();
+                }
+            } else {
+                revert NotParty();
+            }
+        } else if (m.state == MilestoneState.IN_PROGRESS) {
+            if (m.submittedAt == 0) {
+                // (US-13) démarrage frais, jamais soumis — le client ouvre après timeout.
+                if (msg.sender != a.client) revert NotParty();
+                // forge-lint: disable-next-line(block-timestamp)
+                if (block.timestamp <= uint256(m.startedAt) + uint256(a.responseDeadline)) {
+                    revert DeadlineNotReached();
+                }
+            } else {
+                // (boucle) le provider sort d'une boucle de révision après timeout.
+                if (msg.sender != a.provider) revert NotParty();
+                // forge-lint: disable-next-line(block-timestamp)
+                if (block.timestamp <= uint256(m.submittedAt) + uint256(a.responseDeadline)) {
+                    revert DeadlineNotReached();
+                }
+            }
+        } else {
+            revert InvalidMilestoneState();
+        }
+
+        m.state = MilestoneState.DISPUTED;
+        emit DisputeOpened(id, index, msg.sender);
+    }
+
+    // --------------------------------------------------------------------- //
     //                                Internal                               //
     // --------------------------------------------------------------------- //
 
