@@ -29,6 +29,9 @@ contract ClaimPayTest is Test {
     event MilestoneStarted(uint256 indexed id, uint256 indexed index);
     event MilestoneSubmitted(uint256 indexed id, uint256 indexed index, bytes32 deliverableHash);
     event RevisionRequested(uint256 indexed id, uint256 indexed index);
+    event MilestonePaid(
+        uint256 indexed id, uint256 indexed index, address indexed client, address provider, uint256 amount
+    );
 
     function setUp() public {
         vm.prank(admin);
@@ -303,5 +306,104 @@ contract ClaimPayTest is Test {
         vm.prank(client);
         vm.expectRevert(ClaimPay.InvalidMilestoneState.selector);
         claimpay.requestRevision(id, 0);
+    }
+// --------------------------------------------------------------------- //
+    //                              Paiement                                  //
+    // --------------------------------------------------------------------- //
+
+    /// @dev Amène le palier 0 jusqu'à SUBMITTED (prêt à être approuvé/payé).
+    function _toSubmitted(uint256 id) internal {
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+        vm.prank(provider);
+        claimpay.submitMilestone(id, 0, HASH_V1);
+    }
+
+    function test_approveMilestone_paysProvider() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        uint256 clientBefore = usdc.balanceOf(client);
+        uint256 providerBefore = usdc.balanceOf(provider);
+
+        vm.expectEmit(true, true, true, true);
+        emit MilestonePaid(id, 0, client, provider, 1_000e6);
+
+        vm.prank(client);
+        claimpay.approveMilestone(id, 0);
+
+        // Transfert direct client -> provider de 1000 USDC.
+        assertEq(usdc.balanceOf(client), clientBefore - 1_000e6);
+        assertEq(usdc.balanceOf(provider), providerBefore + 1_000e6);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.PAID));
+
+        (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(cursor, 1);
+    }
+
+    function test_approveMilestone_completesAgreement() public {
+        uint256 id = _createAndSign();
+
+        // Palier 0
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.approveMilestone(id, 0);
+
+        // Palier 1
+        vm.prank(client);
+        claimpay.startMilestone(id, 1);
+        vm.prank(provider);
+        claimpay.submitMilestone(id, 1, HASH_V2);
+        vm.prank(client);
+        claimpay.approveMilestone(id, 1);
+
+        // Les deux paliers payés -> 1500 USDC au provider, accord COMPLETED.
+        assertEq(usdc.balanceOf(provider), 1_500e6);
+
+        (,,,,, ClaimPay.AgreementState state, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(uint256(state), uint256(ClaimPay.AgreementState.COMPLETED));
+        assertEq(cursor, 2);
+    }
+
+    function test_approveMilestone_revert_notClient() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.NotClient.selector);
+        claimpay.approveMilestone(id, 0);
+    }
+
+    function test_approveMilestone_revert_notSubmitted() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0); // IN_PROGRESS, pas SUBMITTED
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.InvalidMilestoneState.selector);
+        claimpay.approveMilestone(id, 0);
+    }
+
+    function test_approveMilestone_rollbackIfAllowanceRevoked() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        // Le client retire son allowance juste avant d'approuver.
+        vm.prank(client);
+        usdc.approve(address(claimpay), 0);
+
+        vm.prank(client);
+        vm.expectRevert(); // SafeERC20 revert (allowance insuffisante)
+        claimpay.approveMilestone(id, 0);
+
+        // Rollback prouvé : le palier est resté SUBMITTED, rien n'a été payé.
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.SUBMITTED));
+        assertEq(usdc.balanceOf(provider), 0);
+
+        (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(cursor, 0);
     }
 }
