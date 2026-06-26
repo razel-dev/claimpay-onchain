@@ -4,6 +4,7 @@ pragma solidity ^0.8.24;
 import {Test} from "forge-std/Test.sol";
 import {ClaimPay} from "../src/ClaimPay.sol";
 import {MockUSDC} from "./mocks/MockUSDC.sol";
+import {IAccessControl} from "@openzeppelin/contracts/access/IAccessControl.sol";
 
 contract ClaimPayTest is Test {
     ClaimPay internal claimpay;
@@ -36,6 +37,9 @@ contract ClaimPayTest is Test {
     event DisputeResolved(
         uint256 indexed id, uint256 indexed index, address client, address provider, uint256 amountToProvider
     );
+    event AgreementCancelled(uint256 indexed id, address indexed by);
+    event TokenWhitelisted(address indexed token, bool allowed);
+
 
     function setUp() public {
         vm.prank(admin);
@@ -588,5 +592,96 @@ contract ClaimPayTest is Test {
         vm.prank(arbiter);
         vm.expectRevert(ClaimPay.AmountExceedsMilestone.selector);
         claimpay.resolveDispute(id, 0, 1_000e6 + 1); // > montant du palier
+    }
+
+    // --------------------------------------------------------------------- //
+    //                        Accès, whitelist, cancel                        //
+    // --------------------------------------------------------------------- //
+
+    function test_setTokenWhitelisted_onlyAdmin() public {
+        MockUSDC other = new MockUSDC();
+
+        // Un non-admin ne peut pas whitelister.
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IAccessControl.AccessControlUnauthorizedAccount.selector, client, claimpay.DEFAULT_ADMIN_ROLE()
+            )
+        );
+        vm.prank(client);
+        claimpay.setTokenWhitelisted(address(other), true);
+
+        // L'admin, lui, le peut.
+        vm.prank(admin);
+        claimpay.setTokenWhitelisted(address(other), true);
+        assertTrue(claimpay.isTokenWhitelisted(address(other)));
+    }
+
+    function test_setTokenWhitelisted_revert_zeroAddress() public {
+        vm.prank(admin);
+        vm.expectRevert(ClaimPay.ZeroAddress.selector);
+        claimpay.setTokenWhitelisted(address(0), true);
+    }
+
+    function test_revert_onNonexistentAgreement() public {
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.AgreementDoesNotExist.selector);
+        claimpay.signAgreement(999);
+    }
+
+    // ---- cancelAgreement ----
+    function test_cancel_neverSigned_afterTimeout() public {
+        uint256 id = _create(); // reste DRAFT
+
+        // Avant l'échéance -> revert
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.DeadlineNotReached.selector);
+        claimpay.cancelAgreement(id);
+
+        // Après l'échéance -> OK (le provider n'a jamais signé)
+        vm.warp(block.timestamp + DEADLINE + 1);
+
+        vm.expectEmit(true, true, false, false);
+        emit AgreementCancelled(id, client);
+
+        vm.prank(client);
+        claimpay.cancelAgreement(id);
+
+        (,,,,, ClaimPay.AgreementState state,,,,,) = claimpay.getAgreement(id);
+        assertEq(uint256(state), uint256(ClaimPay.AgreementState.CANCELLED));
+    }
+
+    function test_cancel_activeUntouched_afterTimeout() public {
+        uint256 id = _create();
+        _fundClient(1_500e6);
+        vm.prank(provider);
+        claimpay.signAgreement(id); // ACTIVE, cursor 0, palier PENDING
+
+        vm.warp(block.timestamp + DEADLINE + 1);
+        vm.prank(client);
+        claimpay.cancelAgreement(id);
+
+        (,,,,, ClaimPay.AgreementState state,,,,,) = claimpay.getAgreement(id);
+        assertEq(uint256(state), uint256(ClaimPay.AgreementState.CANCELLED));
+    }
+
+    function test_cancel_revert_notClient() public {
+        uint256 id = _create();
+        vm.warp(block.timestamp + DEADLINE + 1);
+
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.NotClient.selector);
+        claimpay.cancelAgreement(id);
+    }
+
+    function test_cancel_revert_ifMilestoneProgressed() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0); // palier IN_PROGRESS
+
+        vm.warp(block.timestamp + DEADLINE + 1);
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.CannotCancel.selector);
+        claimpay.cancelAgreement(id);
     }
 }
