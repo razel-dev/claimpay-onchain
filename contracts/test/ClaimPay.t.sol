@@ -684,4 +684,56 @@ contract ClaimPayTest is Test {
         vm.expectRevert(ClaimPay.CannotCancel.selector);
         claimpay.cancelAgreement(id);
     }
+
+    // --------------------------------------------------------------------- //
+    //                          Fuzzing                                       //
+    // --------------------------------------------------------------------- //
+
+    /// @dev Pour tout montant valide, la création stocke un total cohérent.
+    function testFuzz_createAgreement_totalMatchesSum(uint128 a0, uint128 a1) public {
+        // On borne pour éviter overflow et montants nuls.
+        vm.assume(a0 > 0 && a1 > 0);
+        uint256[] memory amts = new uint256[](2);
+        amts[0] = uint256(a0);
+        amts[1] = uint256(a1);
+
+        vm.prank(client);
+        uint256 id = claimpay.createAgreement(provider, address(usdc), amts, bytes32(0), arbiter, DEADLINE);
+
+        (,,,, uint256 total,,,,,,) = claimpay.getAgreement(id);
+        assertEq(total, uint256(a0) + uint256(a1));
+    }
+
+    /// @dev Pour tout montant arbitré ≤ palier, le provider reçoit exactement ça
+    ///      et jamais plus que le montant du palier.
+    function testFuzz_resolveDispute_neverPaysMoreThanMilestone(uint256 award) public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        // award borné au montant du palier (1000e6).
+        award = bound(award, 0, 1_000e6);
+
+        uint256 providerBefore = usdc.balanceOf(provider);
+        vm.prank(arbiter);
+        claimpay.resolveDispute(id, 0, award);
+
+        assertEq(usdc.balanceOf(provider), providerBefore + award);
+        assertLe(award, 1_000e6); // jamais plus que le palier
+    }
+
+    /// @dev Tout montant arbitré strictement supérieur au palier revert.
+    function testFuzz_resolveDispute_revertIfExceeds(uint256 excess) public {
+        excess = bound(excess, 1_000e6 + 1, type(uint256).max);
+
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        vm.prank(arbiter);
+        vm.expectRevert(ClaimPay.AmountExceedsMilestone.selector);
+        claimpay.resolveDispute(id, 0, excess);
+    }
 }
