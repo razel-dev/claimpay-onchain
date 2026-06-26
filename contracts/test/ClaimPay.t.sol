@@ -32,6 +32,10 @@ contract ClaimPayTest is Test {
     event MilestonePaid(
         uint256 indexed id, uint256 indexed index, address indexed client, address provider, uint256 amount
     );
+    event DisputeOpened(uint256 indexed id, uint256 indexed index, address indexed opener);
+    event DisputeResolved(
+        uint256 indexed id, uint256 indexed index, address client, address provider, uint256 amountToProvider
+    );
 
     function setUp() public {
         vm.prank(admin);
@@ -405,5 +409,184 @@ contract ClaimPayTest is Test {
 
         (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
         assertEq(cursor, 0);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                               Litiges                                  //
+    // --------------------------------------------------------------------- //
+
+    // ---- Voie A : SUBMITTED + client, à tout moment ----
+    function test_openDispute_clientOnSubmitted() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        vm.expectEmit(true, true, true, false);
+        emit DisputeOpened(id, 0, client);
+
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.DISPUTED));
+    }
+
+    function test_openDispute_revert_thirdParty() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        address stranger = makeAddr("stranger");
+        vm.prank(stranger);
+        vm.expectRevert(ClaimPay.NotParty.selector);
+        claimpay.openDispute(id, 0);
+    }
+
+    // ---- Voie US-14 : SUBMITTED + provider, client fantôme, après délai ----
+    function test_openDispute_US14_providerAfterTimeout() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+
+        // Avant l'échéance -> revert
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.DeadlineNotReached.selector);
+        claimpay.openDispute(id, 0);
+
+        // Après l'échéance (depuis submittedAt) -> OK
+        vm.warp(block.timestamp + DEADLINE + 1);
+        vm.prank(provider);
+        claimpay.openDispute(id, 0);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.DISPUTED));
+    }
+
+    // ---- Voie US-13 : IN_PROGRESS jamais soumis + client, après délai ----
+    function test_openDispute_US13_clientAfterTimeout() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0); // IN_PROGRESS, submittedAt == 0
+
+        // Avant l'échéance -> revert
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.DeadlineNotReached.selector);
+        claimpay.openDispute(id, 0);
+
+        // Après l'échéance (depuis startedAt) -> OK
+        vm.warp(block.timestamp + DEADLINE + 1);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.DISPUTED));
+    }
+
+    // ---- Voie boucle : IN_PROGRESS après révision + provider, après délai ----
+    function test_openDispute_revisionLoopExit_providerAfterTimeout() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+        vm.prank(provider);
+        claimpay.submitMilestone(id, 0, HASH_V1);
+        vm.prank(client);
+        claimpay.requestRevision(id, 0); // IN_PROGRESS, submittedAt != 0
+
+        // Avant l'échéance -> revert
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.DeadlineNotReached.selector);
+        claimpay.openDispute(id, 0);
+
+        // Après l'échéance (depuis submittedAt) -> OK
+        vm.warp(block.timestamp + DEADLINE + 1);
+        vm.prank(provider);
+        claimpay.openDispute(id, 0);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.DISPUTED));
+    }
+
+    // ---- resolveDispute : favorable / partiel / nul ----
+    function test_resolveDispute_fullToProvider() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        uint256 providerBefore = usdc.balanceOf(provider);
+
+        vm.expectEmit(true, true, false, true);
+        emit DisputeResolved(id, 0, client, provider, 1_000e6);
+
+        vm.prank(arbiter);
+        claimpay.resolveDispute(id, 0, 1_000e6);
+
+        assertEq(usdc.balanceOf(provider), providerBefore + 1_000e6);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.PAID));
+        (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(cursor, 1);
+    }
+
+    function test_resolveDispute_partial() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        uint256 clientBefore = usdc.balanceOf(client);
+        uint256 providerBefore = usdc.balanceOf(provider);
+
+        vm.prank(arbiter);
+        claimpay.resolveDispute(id, 0, 400e6); // partiel
+
+        // Provider reçoit 400, le reliquat (600) reste chez le client.
+        assertEq(usdc.balanceOf(provider), providerBefore + 400e6);
+        assertEq(usdc.balanceOf(client), clientBefore - 400e6);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.PAID));
+    }
+
+    function test_resolveDispute_void() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        uint256 clientBefore = usdc.balanceOf(client);
+        uint256 providerBefore = usdc.balanceOf(provider);
+
+        vm.prank(arbiter);
+        claimpay.resolveDispute(id, 0, 0); // rien au provider
+
+        // Aucun transfert : VOID.
+        assertEq(usdc.balanceOf(provider), providerBefore);
+        assertEq(usdc.balanceOf(client), clientBefore);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.VOID));
+        (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(cursor, 1);
+    }
+
+    function test_resolveDispute_revert_notArbiter() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.NotArbiter.selector);
+        claimpay.resolveDispute(id, 0, 500e6);
+    }
+
+    function test_resolveDispute_revert_amountExceeds() public {
+        uint256 id = _createAndSign();
+        _toSubmitted(id);
+        vm.prank(client);
+        claimpay.openDispute(id, 0);
+
+        vm.prank(arbiter);
+        vm.expectRevert(ClaimPay.AmountExceedsMilestone.selector);
+        claimpay.resolveDispute(id, 0, 1_000e6 + 1); // > montant du palier
     }
 }
