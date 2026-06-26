@@ -26,6 +26,9 @@ contract ClaimPayTest is Test {
         uint256 milestoneCount
     );
     event AgreementSigned(uint256 indexed id, address indexed provider);
+    event MilestoneStarted(uint256 indexed id, uint256 indexed index);
+    event MilestoneSubmitted(uint256 indexed id, uint256 indexed index, bytes32 deliverableHash);
+    event RevisionRequested(uint256 indexed id, uint256 indexed index);
 
     function setUp() public {
         vm.prank(admin);
@@ -48,6 +51,20 @@ contract ClaimPayTest is Test {
         id = claimpay.createAgreement(provider, address(usdc), _amounts(), bytes32("terms"), arbiter, DEADLINE);
     }
 
+    /// @dev Donne `amount` de USDC au client et l'autorise sur le contrat.
+    function _fundClient(uint256 amount) internal {
+        usdc.mint(client, amount);
+        vm.prank(client);
+        usdc.approve(address(claimpay), amount);
+    }
+
+    /// @dev Crée un accord, le finance (1500 USDC), et le fait signer -> ACTIVE.
+    function _createAndSign() internal returns (uint256 id) {
+        id = _create();
+        _fundClient(1_500e6);
+        vm.prank(provider);
+        claimpay.signAgreement(id);
+    }
     function test_createAgreement_nominal() public {
         vm.expectEmit(true, true, true, true);
         emit AgreementCreated(0, client, provider, address(usdc), arbiter, 1_500e6, 2);
@@ -159,5 +176,132 @@ contract ClaimPayTest is Test {
         vm.prank(provider);
         vm.expectRevert(ClaimPay.DeadlinePassed.selector);
         claimpay.signAgreement(id);
+    }
+
+    // --------------------------------------------------------------------- //
+    //                    Cycle de vie d'un palier + révisions               //
+    // --------------------------------------------------------------------- //
+
+    bytes32 internal constant HASH_V1 = keccak256("livrable v1");
+    bytes32 internal constant HASH_V2 = keccak256("livrable v2");
+
+    function test_startMilestone_nominal() public {
+        uint256 id = _createAndSign();
+
+        vm.expectEmit(true, true, false, false);
+        emit MilestoneStarted(id, 0);
+
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.IN_PROGRESS));
+        assertGt(m.startedAt, 0);
+        assertEq(m.submittedAt, 0); // jamais soumis
+    }
+
+    function test_startMilestone_revert_insufficientAllowance() public {
+        uint256 id = _create();
+        // signé mais SANS financement -> allowance = 0
+        vm.prank(provider);
+        claimpay.signAgreement(id);
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.InsufficientAllowance.selector);
+        claimpay.startMilestone(id, 0);
+    }
+
+    function test_startMilestone_revert_notClient() public {
+        uint256 id = _createAndSign();
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.NotClient.selector);
+        claimpay.startMilestone(id, 0);
+    }
+
+    function test_startMilestone_revert_wrongIndex() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.NotCurrentMilestone.selector);
+        claimpay.startMilestone(id, 1); // cursor == 0
+    }
+
+    function test_submitMilestone_nominal() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+
+        vm.expectEmit(true, true, false, true);
+        emit MilestoneSubmitted(id, 0, HASH_V1);
+
+        vm.prank(provider);
+        claimpay.submitMilestone(id, 0, HASH_V1);
+
+        ClaimPay.Milestone memory m = claimpay.getMilestone(id, 0);
+        assertEq(uint256(m.state), uint256(ClaimPay.MilestoneState.SUBMITTED));
+        assertEq(m.deliverableHash, HASH_V1);
+        assertGt(m.submittedAt, 0);
+    }
+
+    function test_submitMilestone_revert_notProvider() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.NotProvider.selector);
+        claimpay.submitMilestone(id, 0, HASH_V1);
+    }
+
+    function test_submitMilestone_revert_notStarted() public {
+        uint256 id = _createAndSign();
+        // palier encore PENDING
+        vm.prank(provider);
+        vm.expectRevert(ClaimPay.InvalidMilestoneState.selector);
+        claimpay.submitMilestone(id, 0, HASH_V1);
+    }
+
+    function test_revisionLoop_noFundsMoved_cursorStable() public {
+        uint256 id = _createAndSign();
+
+        vm.prank(client);
+        claimpay.startMilestone(id, 0);
+
+        uint256 clientBalBefore = usdc.balanceOf(client);
+        uint256 providerBalBefore = usdc.balanceOf(provider);
+
+        // Boucle: submit -> revision -> submit -> revision -> submit (3 itérations)
+        for (uint256 i = 0; i < 3; i++) {
+            vm.prank(provider);
+            claimpay.submitMilestone(id, 0, i % 2 == 0 ? HASH_V1 : HASH_V2);
+
+            ClaimPay.Milestone memory ms = claimpay.getMilestone(id, 0);
+            assertEq(uint256(ms.state), uint256(ClaimPay.MilestoneState.SUBMITTED));
+
+            vm.expectEmit(true, true, false, false);
+            emit RevisionRequested(id, 0);
+            vm.prank(client);
+            claimpay.requestRevision(id, 0);
+
+            ms = claimpay.getMilestone(id, 0);
+            assertEq(uint256(ms.state), uint256(ClaimPay.MilestoneState.IN_PROGRESS));
+            assertGt(ms.submittedAt, 0); // marqueur boucle de révision
+        }
+
+        // Aucun fonds n'a bougé, le curseur n'a pas avancé.
+        assertEq(usdc.balanceOf(client), clientBalBefore);
+        assertEq(usdc.balanceOf(provider), providerBalBefore);
+
+        (,,,,,, uint256 cursor,,,,) = claimpay.getAgreement(id);
+        assertEq(cursor, 0);
+    }
+
+    function test_requestRevision_revert_notSubmitted() public {
+        uint256 id = _createAndSign();
+        vm.prank(client);
+        claimpay.startMilestone(id, 0); // IN_PROGRESS, pas SUBMITTED
+
+        vm.prank(client);
+        vm.expectRevert(ClaimPay.InvalidMilestoneState.selector);
+        claimpay.requestRevision(id, 0);
     }
 }
